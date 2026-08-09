@@ -15,21 +15,13 @@
 #define MAX_SPEED 420.0f
 #define FRICTION 8.0f
 
-// Lake on the right side of the baseplate
-#define LAKE_X 560.0f
-#define LAKE_Y 90.0f
-#define LAKE_W 220.0f
-#define LAKE_H 330.0f
-
-// Shop in the top-left corner
-#define SHOP_X 30.0f
-#define SHOP_Y 30.0f
-#define SHOP_W 120.0f
-#define SHOP_H 90.0f
-
 #define INTERACT_RANGE 28.0f
 #define MAX_INVENTORY 32
 #define SHINY_ODDS 100 // 1 in N catches
+
+// Minigame: vertical track; keep the catch bar over the darting fish.
+#define TRACK_H 260.0f
+#define BAR_H 70.0f
 
 // --- Fish data ---------------------------------------------------------------
 
@@ -105,33 +97,171 @@ typedef enum {
     STATE_POPUP,    // caught/escaped/sold message
 } GameState;
 
+// Entities are registered into the ECS in main().
+static sqlite3 *g_db = NULL;
+static int64_t g_player;
+static int64_t g_lake;
+static int64_t g_shop;
+static int64_t g_boundary;
+static int64_t g_fishing; // the fishing minigame entity (game + minigame + hooked fish)
+static int64_t g_popup;   // the popup entity ("fish above the head" icon)
+
 // The ECS owns position/velocity; these globals mirror them each frame so the
 // game logic and rendering can read the player without re-running the query.
 static float px = 380.0f, py = 230.0f;
 static float vx = 0.0f, vy = 0.0f;
 
-static GameState state = STATE_WALK;
-static float stateTimer = 0.0f;
-static float biteAfter = 0.0f;
+static Query g_solids;    // rectangle + solid
+static Query g_inventory; // fish + inventory (caught fish entities in the bag)
 
-static Fish hooked;
-static Fish inventory[MAX_INVENTORY];
-static int inventoryCount = 0;
-static int coins = 0;
+// --- Component specs ---------------------------------------------------------
 
-static char popupText[128] = "";
-static Color popupColor = WHITE;
-static bool popupShowFish = false; // show the fish sprite (catch popups only)
+static const char *pos_cols[] = { "x", "y" };
+static CompSpec pos_spec = { "position", 2, pos_cols };
+static const char *vel_cols[] = { "x", "y" };
+static CompSpec vel_spec = { "velocity", 2, vel_cols };
+static CompSpec square_spec = { "square", 0, NULL };
+static const char *rect_cols[] = { "x", "y", "w", "h" };
+static CompSpec rect_spec = { "rectangle", 4, rect_cols };
+static const char *color_cols[] = { "r", "g", "b", "a" };
+static CompSpec color_spec = { "color", 4, color_cols };
+static CompSpec solid_spec = { "solid", 0, NULL };
+static const char *fish_cols[] = { "species", "length", "shiny" };
+static CompSpec fish_spec = { "fish", 3, fish_cols };
+static const char *game_cols[] = { "state", "timer", "bite_after" };
+static CompSpec game_spec = { "game", 3, game_cols };
+static const char *minigame_cols[] = { "fish_pos", "fish_target", "fish_vel",
+                                       "bar_pos", "bar_vel", "catch_progress" };
+static CompSpec minigame_spec = { "minigame", 6, minigame_cols };
+static const char *popup_cols[] = { "r", "g", "b", "a", "show_fish" };
+static CompSpec popup_spec = { "popup", 5, popup_cols };
+static CompSpec inventory_spec = { "inventory", 0, NULL };
+static const char *wallet_cols[] = { "coins" };
+static CompSpec wallet_spec = { "wallet", 1, wallet_cols };
+
+// --- Component accessors -----------------------------------------------------
+
+static Rectangle entityRect(int64_t id)
+{
+    float d[4];
+    if (ecs_component_get(g_db, &rect_spec, id, d) != 0)
+        return (Rectangle){ 0, 0, 0, 0 };
+    return (Rectangle){ d[0], d[1], d[2], d[3] };
+}
+
+static Color entityColor(int64_t id)
+{
+    float d[4];
+    if (ecs_component_get(g_db, &color_spec, id, d) != 0)
+        return RAYWHITE;
+    return (Color){ (unsigned char)d[0], (unsigned char)d[1],
+                    (unsigned char)d[2], (unsigned char)d[3] };
+}
+
+static void readPlayer(void)
+{
+    float p[2], v[2];
+    ecs_component_get(g_db, &pos_spec, g_player, p);
+    ecs_component_get(g_db, &vel_spec, g_player, v);
+    px = p[0]; py = p[1];
+    vx = v[0]; vy = v[1];
+}
+
+static void writePlayer(void)
+{
+    ecs_component_set(g_db, &pos_spec, g_player, (float[]){ px, py });
+    ecs_component_set(g_db, &vel_spec, g_player, (float[]){ vx, vy });
+}
+
+static void readGame(float out[3])
+{
+    ecs_component_get(g_db, &game_spec, g_fishing, out);
+}
+
+static void writeGame(float state, float timer, float biteAfter)
+{
+    ecs_component_set(g_db, &game_spec, g_fishing, (float[]){ state, timer, biteAfter });
+}
+
+static void readMinigame(float out[6])
+{
+    ecs_component_get(g_db, &minigame_spec, g_fishing, out);
+}
+
+static void writeMinigame(const float in[6])
+{
+    ecs_component_set(g_db, &minigame_spec, g_fishing, in);
+}
+
+static void readHooked(Fish *f)
+{
+    float d[3];
+    ecs_component_get(g_db, &fish_spec, g_fishing, d);
+    f->species = (int)d[0];
+    f->length = d[1];
+    f->shiny = d[2] != 0.0f;
+}
+
+static void writeHooked(const Fish *f)
+{
+    ecs_component_set(g_db, &fish_spec, g_fishing,
+                      (float[]){ (float)f->species, f->length, f->shiny ? 1.0f : 0.0f });
+}
+
+static void readPopupDisplay(Color *c, bool *showFish)
+{
+    float d[5];
+    ecs_component_get(g_db, &popup_spec, g_popup, d);
+    c->r = (unsigned char)d[0];
+    c->g = (unsigned char)d[1];
+    c->b = (unsigned char)d[2];
+    c->a = (unsigned char)d[3];
+    *showFish = d[4] != 0.0f;
+}
+
+static void writePopupDisplay(Color c, bool showFish)
+{
+    ecs_component_set(g_db, &popup_spec, g_popup,
+                      (float[]){ c.r, c.g, c.b, c.a, showFish ? 1.0f : 0.0f });
+}
+
+static void readPopupFish(Fish *f)
+{
+    float d[3];
+    ecs_component_get(g_db, &fish_spec, g_popup, d);
+    f->species = (int)d[0];
+    f->length = d[1];
+    f->shiny = d[2] != 0.0f;
+}
+
+static void writePopupFish(const Fish *f)
+{
+    ecs_component_set(g_db, &fish_spec, g_popup,
+                      (float[]){ (float)f->species, f->length, f->shiny ? 1.0f : 0.0f });
+}
+
+static void readPopupText(char *out, size_t n)
+{
+    ecs_text_get(g_db, "popup_text", "text", g_popup, out, n);
+}
+
+static void readCoins(int *out)
+{
+    float d[1];
+    ecs_component_get(g_db, &wallet_spec, g_player, d);
+    *out = (int)d[0];
+}
+
+static void writeCoins(int coins)
+{
+    ecs_component_set(g_db, &wallet_spec, g_player, (float[]){ (float)coins });
+}
+
+// --- Drawing helpers ---------------------------------------------------------
+
 static Texture2D fishTex;
 static Texture2D speciesTex[SPECIES_COUNT]; // id 0 → fall back to fishTex
 static Font uiFont;
-
-// Handles the ECS needs from the game logic
-static sqlite3 *g_db = NULL;
-static int64_t g_player = 0;
-static CompSpec g_pos;
-static CompSpec g_vel;
-static Query g_render_query;
 
 static Texture2D catchTexture(int species)
 {
@@ -149,39 +279,11 @@ static float measureText(const char *text, float size)
     return MeasureTextEx(uiFont, text, size, 1.0f).x;
 }
 
-// Minigame: vertical track; keep the catch bar over the darting fish.
-#define TRACK_H 260.0f
-#define BAR_H 70.0f
-static float fishPos = 0.5f;    // 0..1 on track (0 = bottom)
-static float fishTarget = 0.5f;
-static float fishVel = 0.0f;
-static float barPos = 0.3f;     // bottom of catch bar, 0..1
-static float barVel = 0.0f;
-static float catchProgress = 0.4f;
-
 static float clampf(float v, float lo, float hi)
 {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
-}
-
-// --- ECS <-> game state sync -------------------------------------------------
-
-static void syncPlayerFromEcs(void)
-{
-    query_reset(&g_render_query);
-    if (!query_next(&g_render_query)) return;
-    px = (float)g_render_query.tables[0].data[0];
-    py = (float)g_render_query.tables[0].data[1];
-    vx = (float)g_render_query.tables[1].data[0];
-    vy = (float)g_render_query.tables[1].data[1];
-}
-
-static void writePlayerToEcs(void)
-{
-    ecs_component_set(g_db, &g_pos, g_player, (float[]){ px, py });
-    ecs_component_set(g_db, &g_vel, g_player, (float[]){ vx, vy });
 }
 
 static Rectangle playerRect(void)
@@ -196,141 +298,188 @@ static bool nearRect(Rectangle r)
     return CheckCollisionRecs(playerRect(), grown);
 }
 
-static bool insideRect(Rectangle r)
+static int inventoryCount(void)
 {
-    return CheckCollisionRecs(playerRect(), r);
+    int n = 0;
+    query_reset(&g_inventory);
+    while (query_next(&g_inventory)) n++;
+    return n;
 }
 
-static Rectangle lakeRect(void) { return (Rectangle){ LAKE_X, LAKE_Y, LAKE_W, LAKE_H }; }
-static Rectangle shopRect(void) { return (Rectangle){ SHOP_X, SHOP_Y, SHOP_W, SHOP_H }; }
-
-static void showPopup(const char *text, Color c)
+static void showPopup(const char *text, Color c, const Fish *f)
 {
-    snprintf(popupText, sizeof(popupText), "%s", text);
-    popupColor = c;
-    popupShowFish = false;
-    state = STATE_POPUP;
-    stateTimer = 0.0f;
+    writeGame((float)STATE_POPUP, 0.0f, 0.0f);
+    ecs_text_set(g_db, "popup_text", "text", g_popup, text);
+    writePopupDisplay(c, f != NULL);
+    if (f) writePopupFish(f);
 }
 
 // --- Update ------------------------------------------------------------------
+
+static void sellFish(void);
+
+// Push the player out of every solid rectangle (lake, shop, boundary) and
+// write any correction back into the ECS.
+static void collideSolids(void)
+{
+    bool pushed = false;
+    query_reset(&g_solids);
+    while (query_next(&g_solids)) {
+        RectF solid = {
+            (float)g_solids.tables[0].data[0],
+            (float)g_solids.tables[0].data[1],
+            (float)g_solids.tables[0].data[2],
+            (float)g_solids.tables[0].data[3],
+        };
+        float pos[2] = { px, py };
+        float vel[2] = { vx, vy };
+        if (collide_solid(pos, vel, PLAYER_SIZE, &solid)) {
+            px = pos[0]; py = pos[1];
+            vx = vel[0]; vy = vel[1];
+            pushed = true;
+        }
+    }
+    if (pushed) writePlayer();
+}
 
 static void updateWalk(float dt)
 {
     (void)dt; // movement itself is run by the ECS update system
 
-    // The lake and the shop are solid; push out along the smallest overlap.
-    // Corrections are written back so the ECS stays the source of truth.
-    bool pushed = false;
-    Rectangle solids[2] = { lakeRect(), shopRect() };
-    for (int i = 0; i < 2; i++) {
-        if (!insideRect(solids[i])) continue;
-        Rectangle r = solids[i];
-        float overL = (px + PLAYER_SIZE) - r.x;
-        float overR = (r.x + r.width) - px;
-        float overT = (py + PLAYER_SIZE) - r.y;
-        float overB = (r.y + r.height) - py;
-        float m = fminf(fminf(overL, overR), fminf(overT, overB));
-        if (m == overL) { px = r.x - PLAYER_SIZE; vx = 0.0f; }
-        else if (m == overR) { px = r.x + r.width; vx = 0.0f; }
-        else if (m == overT) { py = r.y - PLAYER_SIZE; vy = 0.0f; }
-        else { py = r.y + r.height; vy = 0.0f; }
-        pushed = true;
-    }
-    if (pushed) writePlayerToEcs();
+    readPlayer();
+    collideSolids();
 
     if (IsKeyPressed(KEY_E)) {
-        if (nearRect(lakeRect())) {
-            state = STATE_WAITING;
-            stateTimer = 0.0f;
-            biteAfter = 1.0f + rand01() * 3.0f;
-        } else if (nearRect(shopRect())) {
-            if (inventoryCount == 0) {
-                showPopup("Shop: no fish to sell!", RAYWHITE);
-            } else {
-                float total = 0.0f;
-                for (int i = 0; i < inventoryCount; i++) total += fishPrice(inventory[i]);
-                int sold = inventoryCount;
-                coins += (int)total;
-                inventoryCount = 0;
-                char buf[128];
-                snprintf(buf, sizeof(buf), "Sold %d fish for %d coins!", sold, (int)total);
-                showPopup(buf, GOLD);
-            }
+        if (nearRect(entityRect(g_lake))) {
+            writeGame((float)STATE_WAITING, 0.0f, 1.0f + rand01() * 3.0f);
+        } else if (nearRect(entityRect(g_shop))) {
+            sellFish();
         }
     }
 }
 
 static void startMinigame(void)
 {
-    hooked = rollFish();
-    state = STATE_MINIGAME;
-    fishPos = 0.5f; fishTarget = 0.5f; fishVel = 0.0f;
-    barPos = 0.3f; barVel = 0.0f;
-    catchProgress = 0.4f;
+    Fish h = rollFish();
+    writeHooked(&h);
+    writeGame((float)STATE_MINIGAME, 0.0f, 0.0f);
+    float m[6] = { 0.5f, 0.5f, 0.0f, 0.3f, 0.0f, 0.4f };
+    writeMinigame(m);
+}
+
+static void sellFish(void)
+{
+    int64_t ids[MAX_INVENTORY];
+    int count = 0;
+    float total = 0.0f;
+
+    query_reset(&g_inventory);
+    while (query_next(&g_inventory) && count < MAX_INVENTORY) {
+        ids[count] = g_inventory.entity_id;
+        Fish f = {
+            (int)g_inventory.tables[0].data[0],
+            (float)g_inventory.tables[0].data[1],
+            g_inventory.tables[0].data[2] != 0.0f,
+        };
+        total += fishPrice(f);
+        count++;
+    }
+
+    if (count == 0) {
+        showPopup("Shop: no fish to sell!", RAYWHITE, NULL);
+        return;
+    }
+
+    for (int i = 0; i < count; i++) ecs_entity_destroy(g_db, ids[i]);
+
+    int coins;
+    readCoins(&coins);
+    writeCoins(coins + (int)total);
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "Sold %d fish for %d coins!", count, (int)total);
+    showPopup(buf, GOLD, NULL);
 }
 
 static void updateFishing(float dt)
 {
-    stateTimer += dt;
+    float g[3];
+    readGame(g);
+    int state = (int)g[0];
+    g[1] += dt;
 
     if (state == STATE_WAITING) {
-        if (IsKeyPressed(KEY_E)) { state = STATE_WALK; return; } // reel in early
-        if (stateTimer >= biteAfter) { state = STATE_BITE; stateTimer = 0.0f; }
+        if (IsKeyPressed(KEY_E)) { writeGame((float)STATE_WALK, 0.0f, 0.0f); return; } // reel in early
+        if (g[1] >= g[2]) { writeGame((float)STATE_BITE, 0.0f, 0.0f); return; }
+        writeGame((float)state, g[1], g[2]);
         return;
     }
 
     if (state == STATE_BITE) {
         if (IsKeyPressed(KEY_E) || IsKeyPressed(KEY_SPACE)) { startMinigame(); return; }
-        if (stateTimer > 0.7f) {
-            showPopup("It got away...", LIGHTGRAY);
+        if (g[1] > 0.7f) {
+            showPopup("It got away...", LIGHTGRAY, NULL);
+        } else {
+            writeGame((float)state, g[1], g[2]);
         }
         return;
     }
 
     if (state == STATE_MINIGAME) {
+        float m[6];
+        readMinigame(m);
+        Fish h;
+        readHooked(&h);
+
         // Fish darts toward a wandering target; harder species dart faster
-        float difficulty = 0.6f + 0.4f * (float)hooked.species; // 0.6 .. 2.2
-        if (rand01() < dt * (0.8f + 0.5f * difficulty)) fishTarget = rand01();
-        float accel = (fishTarget - fishPos) * (3.0f + 2.0f * difficulty);
-        fishVel += accel * dt;
-        fishVel *= 1.0f / (1.0f + 2.0f * dt);
-        fishPos = clampf(fishPos + fishVel * dt, 0.0f, 1.0f);
+        float difficulty = 0.6f + 0.4f * (float)h.species; // 0.6 .. 2.2
+        if (rand01() < dt * (0.8f + 0.5f * difficulty)) m[1] = rand01();
+        float accel = (m[1] - m[0]) * (3.0f + 2.0f * difficulty);
+        m[2] += accel * dt;
+        m[2] *= 1.0f / (1.0f + 2.0f * dt);
+        m[0] = clampf(m[0] + m[2] * dt, 0.0f, 1.0f);
 
         // Catch bar: hold SPACE to rise, gravity pulls down (Stardew-style)
         float barSpan = BAR_H / TRACK_H;
-        if (IsKeyDown(KEY_SPACE)) barVel += 3.2f * dt;
-        else barVel -= 3.2f * dt;
-        barVel = clampf(barVel, -1.4f, 1.4f);
-        barPos += barVel * dt;
-        if (barPos < 0.0f) { barPos = 0.0f; barVel = 0.0f; }
-        if (barPos > 1.0f - barSpan) { barPos = 1.0f - barSpan; barVel = 0.0f; }
+        if (IsKeyDown(KEY_SPACE)) m[4] += 3.2f * dt;
+        else m[4] -= 3.2f * dt;
+        m[4] = clampf(m[4], -1.4f, 1.4f);
+        m[3] += m[4] * dt;
+        if (m[3] < 0.0f) { m[3] = 0.0f; m[4] = 0.0f; }
+        if (m[3] > 1.0f - barSpan) { m[3] = 1.0f - barSpan; m[4] = 0.0f; }
 
-        bool overlap = fishPos >= barPos && fishPos <= barPos + barSpan;
-        catchProgress += (overlap ? 0.35f : -0.25f) * dt;
+        bool overlap = m[0] >= m[3] && m[0] <= m[3] + barSpan;
+        m[5] += (overlap ? 0.35f : -0.25f) * dt;
 
-        if (catchProgress >= 1.0f) {
-            if (inventoryCount >= MAX_INVENTORY) {
-                showPopup("Caught it - but your bag is full!", ORANGE);
+        writeMinigame(m);
+
+        if (m[5] >= 1.0f) {
+            if (inventoryCount() >= MAX_INVENTORY) {
+                showPopup("Caught it - but your bag is full!", ORANGE, NULL);
             } else {
-                inventory[inventoryCount++] = hooked;
+                // The catch becomes its own entity in the bag.
+                int64_t caught = ecs_entity_create(g_db);
+                ecs_component_set(g_db, &fish_spec, caught,
+                                  (float[]){ (float)h.species, h.length, h.shiny ? 1.0f : 0.0f });
+                ecs_component_set(g_db, &inventory_spec, caught, NULL);
                 char buf[128];
                 snprintf(buf, sizeof(buf), "Caught a %s%s! %.0f cm - worth %d coins",
-                         hooked.shiny ? "SHINY " : "", SPECIES[hooked.species].name,
-                         hooked.length, (int)fishPrice(hooked));
-                showPopup(buf, hooked.shiny ? GOLD : SKYBLUE);
-                popupShowFish = true;
+                         h.shiny ? "SHINY " : "", SPECIES[h.species].name,
+                         h.length, (int)fishPrice(h));
+                showPopup(buf, h.shiny ? GOLD : SKYBLUE, &h);
             }
-        } else if (catchProgress <= 0.0f) {
-            showPopup("The fish escaped!", LIGHTGRAY);
+        } else if (m[5] <= 0.0f) {
+            showPopup("The fish escaped!", LIGHTGRAY, NULL);
         }
         return;
     }
 
     if (state == STATE_POPUP) {
-        if (stateTimer > 0.6f &&
-            (IsKeyPressed(KEY_E) || IsKeyPressed(KEY_SPACE) || stateTimer > 3.0f)) {
-            state = STATE_WALK;
+        if (g[1] > 0.6f &&
+            (IsKeyPressed(KEY_E) || IsKeyPressed(KEY_SPACE) || g[1] > 3.0f)) {
+            writeGame((float)STATE_WALK, 0.0f, 0.0f);
+        } else {
+            writeGame((float)state, g[1], g[2]);
         }
         return;
     }
@@ -353,8 +502,8 @@ static void drawWorld(void)
     }
 
     // Lake
-    Rectangle lake = lakeRect();
-    DrawRectangleRounded(lake, 0.25f, 8, (Color){ 38, 92, 150, 255 });
+    Rectangle lake = entityRect(g_lake);
+    DrawRectangleRounded(lake, 0.25f, 8, entityColor(g_lake));
     double tnow = GetTime();
     for (int i = 0; i < 4; i++) {
         float wy = lake.y + 40.0f + 70.0f * i + 6.0f * sinf((float)tnow * 1.5f + i * 1.7f);
@@ -363,27 +512,36 @@ static void drawWorld(void)
     }
 
     // Shop
-    Rectangle shop = shopRect();
-    DrawRectangleRec(shop, (Color){ 120, 80, 48, 255 });
+    Rectangle shop = entityRect(g_shop);
+    DrawRectangleRec(shop, entityColor(g_shop));
     DrawRectangleRec((Rectangle){ shop.x, shop.y, shop.width, 22 }, (Color){ 165, 42, 42, 255 });
-    drawText("FISH SHOP", shop.x + 14, shop.y + 2, 18, RAYWHITE);
+    char label[64];
+    if (ecs_text_get(g_db, "name", "label", g_shop, label, sizeof(label)) == 0) {
+        drawText(label, shop.x + 14, shop.y + 2, 18, RAYWHITE);
+    }
     DrawRectangleLinesEx(shop, 3.0f, (Color){ 60, 40, 24, 255 });
 
-    DrawRectangleLinesEx((Rectangle){ 2, 2, PLATE_W - 4, PLATE_H - 4 }, 4.0f,
-                         (Color){ 0, 0, 0, 89 });
+    // World boundary
+    Rectangle bound = entityRect(g_boundary);
+    DrawRectangleLinesEx(bound, 4.0f, (Color){ 0, 0, 0, 89 });
 }
 
 static void drawPlayer(void)
 {
+    Color body = entityColor(g_player);
+
     DrawRectangleRec((Rectangle){ px + 4, py + 6, PLAYER_SIZE, PLAYER_SIZE },
                      (Color){ 0, 0, 0, 64 });
-    DrawRectangleRec(playerRect(), (Color){ 228, 179, 48, 255 });
+    DrawRectangleRec(playerRect(), body);
     DrawRectangleLinesEx((Rectangle){ px + 1.5f, py + 1.5f, PLAYER_SIZE - 3, PLAYER_SIZE - 3 },
                          3.0f, (Color){ 138, 106, 21, 255 });
 
     // Fishing rod + line while fishing
+    float g[3];
+    readGame(g);
+    int state = (int)g[0];
     if (state == STATE_WAITING || state == STATE_BITE || state == STATE_MINIGAME) {
-        Rectangle lake = lakeRect();
+        Rectangle lake = entityRect(g_lake);
         Vector2 hand = { px + PLAYER_SIZE, py + 8 };
         Vector2 tip = { hand.x + 26, hand.y - 22 };
         Vector2 bobber = { clampf(px + PLAYER_SIZE + 60, lake.x + 15, lake.x + lake.width - 15),
@@ -399,6 +557,11 @@ static void drawPlayer(void)
 
 static void drawMinigame(void)
 {
+    float m[6];
+    readMinigame(m);
+    Fish h;
+    readHooked(&h);
+
     float trackX = PLATE_W - 70.0f;
     float trackY = (PLATE_H - TRACK_H) / 2.0f;
 
@@ -406,32 +569,38 @@ static void drawMinigame(void)
                      (Color){ 20, 30, 40, 230 });
     // Catch bar
     float barSpan = BAR_H / TRACK_H;
-    float barY = trackY + TRACK_H * (1.0f - barPos - barSpan);
+    float barY = trackY + TRACK_H * (1.0f - m[3] - barSpan);
     DrawRectangleRec((Rectangle){ trackX - 4, barY, 32, BAR_H }, (Color){ 80, 200, 120, 200 });
     // Fish
-    float fy = trackY + TRACK_H * (1.0f - fishPos);
+    float fy = trackY + TRACK_H * (1.0f - m[0]);
     DrawCircle((int)(trackX + 12), (int)fy, 8.0f,
-               hooked.shiny ? GOLD : SPECIES[hooked.species].color);
+               h.shiny ? GOLD : SPECIES[h.species].color);
     // Progress bar
     DrawRectangleRec((Rectangle){ trackX + 36, trackY, 10, TRACK_H }, (Color){ 20, 30, 40, 230 });
-    DrawRectangleRec((Rectangle){ trackX + 36, trackY + TRACK_H * (1.0f - catchProgress),
-                                  10, TRACK_H * catchProgress },
+    DrawRectangleRec((Rectangle){ trackX + 36, trackY + TRACK_H * (1.0f - m[5]),
+                                  10, TRACK_H * m[5] },
                      (Color){ 240, 200, 60, 255 });
     drawText("HOLD SPACE", trackX - 40, trackY + TRACK_H + 14, 16, RAYWHITE);
 }
 
 static void drawHud(void)
 {
+    int coins;
+    readCoins(&coins);
     char buf[64];
     snprintf(buf, sizeof(buf), "Coins: %d", coins);
     drawText(buf, 12, 10, 22, GOLD);
-    snprintf(buf, sizeof(buf), "Fish: %d/%d", inventoryCount, MAX_INVENTORY);
+    snprintf(buf, sizeof(buf), "Fish: %d/%d", inventoryCount(), MAX_INVENTORY);
     drawText(buf, 12, 34, 22, SKYBLUE);
 
+    float g[3];
+    readGame(g);
+    int state = (int)g[0];
+
     if (state == STATE_WALK) {
-        if (nearRect(lakeRect())) {
+        if (nearRect(entityRect(g_lake))) {
             drawText("[E] Cast line", px - 20, py - 26, 18, RAYWHITE);
-        } else if (nearRect(shopRect())) {
+        } else if (nearRect(entityRect(g_shop))) {
             drawText("[E] Sell fish", px - 20, py - 26, 18, RAYWHITE);
         }
     } else if (state == STATE_WAITING) {
@@ -441,24 +610,34 @@ static void drawHud(void)
     }
 
     if (state == STATE_POPUP) {
-        int w = (int)measureText(popupText, 22);
+        char text[128];
+        readPopupText(text, sizeof(text));
+        Color c;
+        bool showFish;
+        readPopupDisplay(&c, &showFish);
+
+        int w = (int)measureText(text, 22);
         DrawRectangle((int)(PLATE_W / 2) - w / 2 - 16, 190, w + 32, 46,
                       (Color){ 20, 30, 40, 230 });
-        drawText(popupText, PLATE_W / 2.0f - w / 2.0f, 200, 22, popupColor);
+        drawText(text, PLATE_W / 2.0f - w / 2.0f, 200, 22, c);
 
-        // Hold the catch overhead, Stardew-style (one sprite for all fish
-        // for now; per-species sprites later). Shinies get a gold tint.
-        Texture2D tex = catchTexture(hooked.species);
-        if (popupShowFish && tex.id != 0) {
-            float s = 64.0f / (float)tex.height; // ~64 px tall on screen
-            float fw = tex.width * s, fh = tex.height * s;
-            float bob = 4.0f * sinf((float)GetTime() * 4.0f);
-            DrawTexturePro(tex,
-                           (Rectangle){ 0, 0, (float)tex.width, (float)tex.height },
-                           (Rectangle){ px + PLAYER_SIZE / 2.0f - fw / 2.0f,
-                                        py - fh - 12.0f + bob, fw, fh },
-                           (Vector2){ 0, 0 }, 0.0f,
-                           hooked.shiny ? GOLD : WHITE);
+        // Hold the catch overhead, Stardew-style. The popup entity owns the
+        // fish being displayed; shinies get a gold tint.
+        if (showFish) {
+            Fish pf;
+            readPopupFish(&pf);
+            Texture2D tex = catchTexture(pf.species);
+            if (tex.id != 0) {
+                float s = 64.0f / (float)tex.height; // ~64 px tall on screen
+                float fw = tex.width * s, fh = tex.height * s;
+                float bob = 4.0f * sinf((float)GetTime() * 4.0f);
+                DrawTexturePro(tex,
+                               (Rectangle){ 0, 0, (float)tex.width, (float)tex.height },
+                               (Rectangle){ px + PLAYER_SIZE / 2.0f - fw / 2.0f,
+                                            py - fh - 12.0f + bob, fw, fh },
+                               (Vector2){ 0, 0 }, 0.0f,
+                               pf.shiny ? GOLD : WHITE);
+            }
         }
     }
 
@@ -480,49 +659,84 @@ int main(void)
         sqlite3_close(db);
         return 1;
     }
+    g_db = db;
 
-    static const char *pos_cols[] = { "x", "y" };
-    static const char *vel_cols[] = { "x", "y" };
-    CompSpec pos = { "position", 2, pos_cols };
-    CompSpec vel = { "velocity", 2, vel_cols };
-    CompSpec square = { "square", 0, NULL };
-
-    int64_t player = ecs_entity_create(db);
-    if (player < 1) {
+    // Player
+    g_player = ecs_entity_create(db);
+    if (g_player < 1) {
         sqlite3_close(db);
         return 1;
     }
-    ecs_component_set(db, &pos, player, (float[]){ px, py });
-    ecs_component_set(db, &vel, player, (float[]){ 0.0f, 0.0f });
-    ecs_component_set(db, &square, player, NULL);
+    ecs_component_set(db, &pos_spec, g_player, (float[]){ 380.0f, 230.0f });
+    ecs_component_set(db, &vel_spec, g_player, (float[]){ 0.0f, 0.0f });
+    ecs_component_set(db, &square_spec, g_player, NULL);
+    ecs_component_set(db, &color_spec, g_player, (float[]){ 228, 179, 48, 255 });
+    ecs_component_set(db, &wallet_spec, g_player, (float[]){ 0 });
 
+    // Lake
+    g_lake = ecs_entity_create(db);
+    ecs_component_set(db, &rect_spec, g_lake, (float[]){ 560.0f, 90.0f, 220.0f, 330.0f });
+    ecs_component_set(db, &solid_spec, g_lake, NULL);
+    ecs_component_set(db, &color_spec, g_lake, (float[]){ 38, 92, 150, 255 });
+    ecs_text_set(db, "name", "label", g_lake, "LAKE");
+
+    // Shop
+    g_shop = ecs_entity_create(db);
+    ecs_component_set(db, &rect_spec, g_shop, (float[]){ 30.0f, 30.0f, 120.0f, 90.0f });
+    ecs_component_set(db, &solid_spec, g_shop, NULL);
+    ecs_component_set(db, &color_spec, g_shop, (float[]){ 120, 80, 48, 255 });
+    ecs_text_set(db, "name", "label", g_shop, "FISH SHOP");
+
+    // World boundary (defines the plate and its walls)
+    g_boundary = ecs_entity_create(db);
+    ecs_component_set(db, &rect_spec, g_boundary, (float[]){ 0.0f, 0.0f, PLATE_W, PLATE_H });
+    ecs_component_set(db, &solid_spec, g_boundary, NULL);
+
+    // Fishing minigame entity (state machine + catch bar + hooked fish)
+    g_fishing = ecs_entity_create(db);
+    ecs_component_set(db, &game_spec, g_fishing, (float[]){ STATE_WALK, 0.0f, 0.0f });
+    ecs_component_set(db, &minigame_spec, g_fishing, (float[]){ 0.5f, 0.5f, 0.0f, 0.3f, 0.0f, 0.4f });
+    ecs_component_set(db, &fish_spec, g_fishing, (float[]){ 0, 0.0f, 0 });
+
+    // Popup entity (the "fish above the head" icon)
+    g_popup = ecs_entity_create(db);
+    ecs_component_set(db, &popup_spec, g_popup, (float[]){ 255, 255, 255, 255, 0 });
+    ecs_text_set(db, "popup_text", "text", g_popup, "");
+    ecs_component_set(db, &fish_spec, g_popup, (float[]){ 0, 0.0f, 0 });
+
+    // Movement system. The world boundary entity's rectangle is the plate.
+    Rectangle bound = entityRect(g_boundary);
     UpdateSystemConfig cfg = {
         .dim = 2,
         .params = { ACCEL, MAX_SPEED, FRICTION },
-        .lo = { 0.0f, 0.0f },
-        .hi = { PLATE_W - PLAYER_SIZE, PLATE_H - PLAYER_SIZE },
-        .pos = pos,
-        .vel = vel,
+        .lo = { bound.x, bound.y },
+        .hi = { bound.x + bound.width - PLAYER_SIZE, bound.y + bound.height - PLAYER_SIZE },
+        .pos = pos_spec,
+        .vel = vel_spec,
         .tag_table = "square",
     };
-
     UpdateSystem update_system;
     if (update_system_init(&update_system, db, &cfg) != 0) {
         sqlite3_close(db);
         return 1;
     }
 
-    CompSpec render_specs[3] = { pos, vel, square };
-    if (query_init(&g_render_query, db, render_specs, 3) != 0) {
+    // Query over every solid rectangle (lake, shop, boundary)
+    CompSpec solid_specs[2] = { rect_spec, solid_spec };
+    if (query_init(&g_solids, db, solid_specs, 2) != 0) {
         update_system_destroy(&update_system);
         sqlite3_close(db);
         return 1;
     }
 
-    g_db = db;
-    g_player = player;
-    g_pos = pos;
-    g_vel = vel;
+    // Query over caught-fish entities still in the bag (fish + inventory)
+    CompSpec inv_specs[2] = { fish_spec, inventory_spec };
+    if (query_init(&g_inventory, db, inv_specs, 2) != 0) {
+        query_destroy(&g_solids);
+        update_system_destroy(&update_system);
+        sqlite3_close(db);
+        return 1;
+    }
 
     // The game simulates and draws in a fixed logical resolution (PLATE_W x
     // PLATE_H) and is scaled to whatever window/monitor size the player picks,
@@ -550,7 +764,9 @@ int main(void)
 
         if (IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();
 
-        if (state == STATE_WALK) {
+        float g[3];
+        readGame(g);
+        if ((int)g[0] == STATE_WALK) {
             float input[2] = {
                 (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
                   - (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)),
@@ -559,16 +775,18 @@ int main(void)
             };
 
             update_system_run(&update_system, dt, input);
-            syncPlayerFromEcs();
             updateWalk(dt);
         } else {
             updateFishing(dt);
         }
 
+        // State may have changed during the update (e.g. bite -> minigame)
+        readGame(g);
+
         BeginTextureMode(target);
         drawWorld();
         drawPlayer();
-        if (state == STATE_MINIGAME) drawMinigame();
+        if ((int)g[0] == STATE_MINIGAME) drawMinigame();
         drawHud();
         EndTextureMode();
 
@@ -593,7 +811,8 @@ int main(void)
     UnloadTexture(fishTex);
     UnloadRenderTexture(target);
     CloseWindow();
-    query_destroy(&g_render_query);
+    query_destroy(&g_inventory);
+    query_destroy(&g_solids);
     update_system_destroy(&update_system);
     sqlite3_close(db);
     return 0;

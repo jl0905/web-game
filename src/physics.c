@@ -42,3 +42,28 @@ void collide_bounds(float *pos, float *vel, int dim, const float *lo, const floa
         }
     }
 }
+
+int collide_solid(float pos[2], float vel[2], float size, const RectF *solid)
+{
+    float px = pos[0];
+    float py = pos[1];
+
+    // Touching edges do not count as overlap (same semantics as before).
+    if (px >= solid->x + solid->w || px + size <= solid->x ||
+        py >= solid->y + solid->h || py + size <= solid->y) {
+        return 0;
+    }
+
+    // Push out along the smallest overlap.
+    float overL = (px + size) - solid->x;
+    float overR = (solid->x + solid->w) - px;
+    float overT = (py + size) - solid->y;
+    float overB = (solid->y + solid->h) - py;
+    float m = fminf(fminf(overL, overR), fminf(overT, overB));
+
+    if (m == overL) { pos[0] = solid->x - size; vel[0] = 0.0f; }
+    else if (m == overR) { pos[0] = solid->x + solid->w; vel[0] = 0.0f; }
+    else if (m == overT) { pos[1] = solid->y - size; vel[1] = 0.0f; }
+    else { pos[1] = solid->y + solid->h; vel[1] = 0.0f; }
+    return 1;
+}
