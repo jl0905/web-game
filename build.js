@@ -26,7 +26,6 @@ const SRCS = [
   "src/query.c",
   "src/ecs.c",
   "src/physics.c",
-  "src/update_system.c",
 ];
 
 function fail(msg) {

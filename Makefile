@@ -6,7 +6,7 @@ SQLITE_DIR  := vendors/sqlite
 SQLITE_C    := $(SQLITE_DIR)/sqlite3.c
 SQLITE_O    := $(SQLITE_DIR)/sqlite3.o
 INCLUDE_DIR := include
-SRCS        := src/main.c src/query.c src/ecs.c src/physics.c src/update_system.c
+SRCS        := src/main.c src/query.c src/ecs.c src/physics.c
 OBJS        := $(SRCS:.c=.o)
 CFLAGS      := -std=c99 -Wall -Wextra -O2 -I$(RAYLIB_SRC) -I$(SQLITE_DIR) -I$(INCLUDE_DIR)
 SQLITE_CFLAGS := -std=c99 -O2 -DSQLITE_OMIT_LOAD_EXTENSION

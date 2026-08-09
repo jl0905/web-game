@@ -8,7 +8,7 @@ velocity, and square components) stored in an in-memory SQLite database.
 ## Layout
 
 - `src/main.c` — game loop, input, rendering
-- `src/query.c`, `src/ecs.c`, `src/physics.c`, `src/update_system.c` — engine modules
+- `src/query.c`, `src/ecs.c`, `src/physics.c` — engine modules
 - `include/` — public headers for the engine modules
 - `vendors/raylib` — raylib as a git submodule
 - `vendors/sqlite` — SQLite amalgamation (`sqlite3.c`) as a git submodule

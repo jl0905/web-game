@@ -1,8 +1,8 @@
 #include "ecs.h"
+#include "physics.h"
 #include "query.h"
 #include "raylib.h"
 #include "sqlite3.h"
-#include "update_system.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -257,6 +257,121 @@ static void writeCoins(int coins)
     ecs_component_set(g_db, &wallet_spec, g_player, (float[]){ (float)coins });
 }
 
+// --- Movement system ---------------------------------------------------------
+// The player's position/velocity live in the ECS; the movement query streams
+// every entity with position + velocity + square components, runs the physics
+// integrate/bounds steps, and writes the results back with prepared UPDATEs.
+
+typedef struct {
+    int dim;
+    PhysicsParams params;
+    float lo[PHYS_MAX_DIM];
+    float hi[PHYS_MAX_DIM];
+    CompSpec pos;
+    CompSpec vel;
+    const char *tag_table;
+} UpdateSystemConfig;
+
+typedef struct {
+    Query query;
+    sqlite3_stmt *upd_pos;
+    sqlite3_stmt *upd_vel;
+    int dim;
+    PhysicsParams params;
+    float lo[PHYS_MAX_DIM];
+    float hi[PHYS_MAX_DIM];
+} UpdateSystem;
+
+typedef enum {
+    COMP_POSITION = 0,
+    COMP_VELOCITY = 1,
+    COMP_SQUARE   = 2,
+} Component;
+
+static int prepare_update(sqlite3 *db, sqlite3_stmt **out, const CompSpec *spec)
+{
+    char sql[192];
+    int off = snprintf(sql, sizeof sql, "UPDATE %s SET ", spec->table);
+    for (int i = 0; i < spec->ncols; i++)
+        off += snprintf(sql + off, sizeof sql - (size_t)off,
+                        "%s%s=?%d", i > 0 ? "," : "", spec->cols[i], i + 1);
+    off += snprintf(sql + off, sizeof sql - (size_t)off,
+                    " WHERE entity_id=?%d", spec->ncols + 1);
+
+    if (sqlite3_prepare_v2(db, sql, -1, out, NULL) != SQLITE_OK) {
+        fprintf(stderr, "prepare_update(%s): %s\n", spec->table, sqlite3_errmsg(db));
+        return -1;
+    }
+    return 0;
+}
+
+static int update_system_init(UpdateSystem *s, sqlite3 *db, const UpdateSystemConfig *cfg)
+{
+    if (cfg->dim < 1 || cfg->dim > PHYS_MAX_DIM) {
+        fprintf(stderr, "update_system_init: dim %d out of range [1, %d]\n", cfg->dim, PHYS_MAX_DIM);
+        return -1;
+    }
+    if (cfg->dim != cfg->pos.ncols || cfg->dim != cfg->vel.ncols) {
+        fprintf(stderr, "update_system_init: dim %d does not match component column counts\n", cfg->dim);
+        return -1;
+    }
+
+    CompSpec specs[3] = {
+        cfg->pos,
+        cfg->vel,
+        { cfg->tag_table, 0, NULL },
+    };
+
+    s->dim = cfg->dim;
+    s->params = cfg->params;
+    for (int i = 0; i < cfg->dim; i++) {
+        s->lo[i] = cfg->lo[i];
+        s->hi[i] = cfg->hi[i];
+    }
+
+    if (query_init(&s->query, db, specs, 3) != 0) return -1;
+    if (prepare_update(db, &s->upd_pos, &cfg->pos) != 0) return -1;
+    if (prepare_update(db, &s->upd_vel, &cfg->vel) != 0) return -1;
+    return 0;
+}
+
+static void update_system_run(UpdateSystem *s, float dt, const float *input)
+{
+    Query *q = &s->query;
+    query_reset(q);
+
+    while (query_next(q)) {
+        float pos[PHYS_MAX_DIM];
+        float vel[PHYS_MAX_DIM];
+        for (int i = 0; i < s->dim; i++) {
+            pos[i] = (float)q->tables[COMP_POSITION].data[i];
+            vel[i] = (float)q->tables[COMP_VELOCITY].data[i];
+        }
+
+        integrate(dt, input, pos, vel, s->dim, &s->params);
+        collide_bounds(pos, vel, s->dim, s->lo, s->hi);
+
+        sqlite3_reset(s->upd_pos);
+        for (int i = 0; i < s->dim; i++)
+            sqlite3_bind_double(s->upd_pos, i + 1, pos[i]);
+        sqlite3_bind_int(s->upd_pos, s->dim + 1, q->entity_id);
+        sqlite3_step(s->upd_pos);
+
+        sqlite3_reset(s->upd_vel);
+        for (int i = 0; i < s->dim; i++)
+            sqlite3_bind_double(s->upd_vel, i + 1, vel[i]);
+        sqlite3_bind_int(s->upd_vel, s->dim + 1, q->entity_id);
+        sqlite3_step(s->upd_vel);
+    }
+}
+
+static void update_system_destroy(UpdateSystem *s)
+{
+    query_destroy(&s->query);
+    sqlite3_finalize(s->upd_pos);
+    sqlite3_finalize(s->upd_vel);
+}
+
 // --- Drawing helpers ---------------------------------------------------------
 
 static Texture2D fishTex;
@@ -318,8 +433,9 @@ static void showPopup(const char *text, Color c, const Fish *f)
 
 static void sellFish(void);
 
-// Push the player out of every solid rectangle (lake, shop, boundary) and
-// write any correction back into the ECS.
+// Push the player out of every solid rectangle (lake, shop) and write any
+// correction back into the ECS. The world boundary is handled by the physics
+// bounds in the update system, not by push-out collision.
 static void collideSolids(void)
 {
     bool pushed = false;
@@ -687,10 +803,11 @@ int main(void)
     ecs_component_set(db, &color_spec, g_shop, (float[]){ 120, 80, 48, 255 });
     ecs_text_set(db, "name", "label", g_shop, "FISH SHOP");
 
-    // World boundary (defines the plate and its walls)
+    // World boundary (defines the plate and its walls). Its rectangle is the
+    // source for the physics bounds below; it is NOT a push-out solid, or the
+    // player (who lives inside it) would be shoved off-screen.
     g_boundary = ecs_entity_create(db);
     ecs_component_set(db, &rect_spec, g_boundary, (float[]){ 0.0f, 0.0f, PLATE_W, PLATE_H });
-    ecs_component_set(db, &solid_spec, g_boundary, NULL);
 
     // Fishing minigame entity (state machine + catch bar + hooked fish)
     g_fishing = ecs_entity_create(db);
@@ -721,7 +838,7 @@ int main(void)
         return 1;
     }
 
-    // Query over every solid rectangle (lake, shop, boundary)
+    // Query over every solid rectangle (lake, shop)
     CompSpec solid_specs[2] = { rect_spec, solid_spec };
     if (query_init(&g_solids, db, solid_specs, 2) != 0) {
         update_system_destroy(&update_system);
