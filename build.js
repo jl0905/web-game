@@ -3,8 +3,9 @@
 // Steps:
 //   1. Compile raylib (from the vendors/raylib submodule) for PLATFORM_WEB
 //      into vendors/raylib/src/libraylib.web.a using its own Makefile.
-//   2. Compile src/main.c with emcc, linking raylib and wrapping everything
-//      in src/shell.html, producing public/index.html + index.js + index.wasm.
+//   2. Compile the game sources in src/ (with headers from include/) using
+//      emcc, linking raylib and sqlite and wrapping everything in
+//      src/shell.html, producing public/index.html + index.js + index.wasm.
 //
 // Requires Node.js and the Emscripten SDK (emcc) on PATH.
 
@@ -20,6 +21,13 @@ const SHELL = path.join("src", "shell.html");
 const OUT = path.join("public", "index.html");
 const SQLITE_DIR = path.join("vendors", "sqlite");
 const SQLITE_C = path.join(SQLITE_DIR, "sqlite3.c");
+const SRCS = [
+  "src/main.c",
+  "src/query.c",
+  "src/ecs.c",
+  "src/physics.c",
+  "src/update_system.c",
+];
 
 function fail(msg) {
   console.error(`ERROR: ${msg}`);
@@ -96,11 +104,12 @@ function buildGame() {
   console.log("Compiling game to public/index.wasm...");
   fs.mkdirSync("public", { recursive: true });
   const args = [
-    "src/main.c",
+    ...SRCS,
     "-o", OUT,
     "-DPLATFORM_WEB",
     "-DSQLITE_OMIT_LOAD_EXTENSION",
     "-Isrc",
+    "-Iinclude",
     `-I${RAYLIB_SRC}`,
     `-I${SQLITE_DIR}`,
     SQLITE_C,
