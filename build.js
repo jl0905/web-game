@@ -18,6 +18,8 @@ const RAYLIB_WEB_LIB = path.join(RAYLIB_SRC, "libraylib.web.a");
 const STAMP = path.join(RAYLIB_SRC, ".build-platform");
 const SHELL = path.join("src", "shell.html");
 const OUT = path.join("public", "index.html");
+const SQLITE_DIR = path.join("vendors", "sqlite");
+const SQLITE_C = path.join(SQLITE_DIR, "sqlite3.c");
 
 function fail(msg) {
   console.error(`ERROR: ${msg}`);
@@ -97,8 +99,11 @@ function buildGame() {
     "src/main.c",
     "-o", OUT,
     "-DPLATFORM_WEB",
+    "-DSQLITE_OMIT_LOAD_EXTENSION",
     "-Isrc",
     `-I${RAYLIB_SRC}`,
+    `-I${SQLITE_DIR}`,
+    SQLITE_C,
     RAYLIB_WEB_LIB,
     "-sUSE_GLFW=3",
     "-sFORCE_FILESYSTEM=1",

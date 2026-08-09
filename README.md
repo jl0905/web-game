@@ -2,17 +2,19 @@
 
 A C + raylib game: a player-controlled square moving on a rectangular
 baseplate. All simulation (input acceleration, friction, speed clamping, wall
-collision) is written in C using raylib for input, windowing, and rendering.
+collision) is written in C, with game state (entities and their position,
+velocity, and square components) stored in an in-memory SQLite database.
 
 ## Layout
 
 - `src/main.c` — game logic and rendering
 - `vendors/raylib` — raylib as a git submodule
-- `Makefile` — builds raylib (via `mingw32-make`) and the game
+- `vendors/sqlite` — SQLite amalgamation (`sqlite3.c`) as a git submodule
+- `Makefile` — builds raylib, SQLite, and the game
 
 ## Setup
 
-raylib is pinned as a git submodule. On a fresh clone:
+Dependencies are pinned as git submodules. On a fresh clone:
 
 ```sh
 git submodule update --init

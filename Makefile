@@ -2,11 +2,18 @@ CC          := gcc
 RAYLIB_SRC  := vendors/raylib/src
 RAYLIB_LIB  := $(RAYLIB_SRC)/libraylib.a
 RAYLIB_STAMP := $(RAYLIB_SRC)/.build-platform
-CFLAGS      := -std=c99 -Wall -Wextra -O2 -I$(RAYLIB_SRC)
-LIBS        := $(RAYLIB_LIB) -lopengl32 -lgdi32 -lwinmm -lm
+SQLITE_DIR  := vendors/sqlite
+SQLITE_C    := $(SQLITE_DIR)/sqlite3.c
+SQLITE_O    := $(SQLITE_DIR)/sqlite3.o
+CFLAGS      := -std=c99 -Wall -Wextra -O2 -I$(RAYLIB_SRC) -I$(SQLITE_DIR)
+SQLITE_CFLAGS := -std=c99 -O2 -DSQLITE_OMIT_LOAD_EXTENSION
+LIBS        := $(RAYLIB_LIB) $(SQLITE_O) -lopengl32 -lgdi32 -lwinmm -lm
 
-game.exe: src/main.c $(RAYLIB_LIB)
+game.exe: src/main.c $(RAYLIB_LIB) $(SQLITE_O)
 	$(CC) $(CFLAGS) src/main.c $(LIBS) -o game.exe
+
+$(SQLITE_O): $(SQLITE_C)
+	$(CC) $(SQLITE_CFLAGS) -c $(SQLITE_C) -o $(SQLITE_O)
 
 # raylib's Makefile compiles objects in-tree, so a web build (build.js) would
 # leave stale objects behind. Rebuild for desktop if it was built for web.
@@ -22,6 +29,7 @@ run: game.exe
 
 clean:
 	-del game.exe
+	-del "$(SQLITE_DIR)\sqlite3.o"
 	mingw32-make -C $(RAYLIB_SRC) clean
 	-del "$(RAYLIB_STAMP)"
 

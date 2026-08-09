@@ -1,3 +1,6 @@
 [submodule "vendors/raylib"]
 	path = vendors/raylib
 	url = https://github.com/raysan5/raylib.git
+[submodule "vendors/sqlite"]
+	path = vendors/sqlite
+	url = https://github.com/EdenLabs/sqlite3-amalgamation.git
