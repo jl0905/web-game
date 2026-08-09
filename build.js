@@ -114,6 +114,7 @@ function buildGame() {
     `-I${SQLITE_DIR}`,
     SQLITE_C,
     RAYLIB_WEB_LIB,
+    "--preload-file", "assets",
     "-sUSE_GLFW=3",
     "-sFORCE_FILESYSTEM=1",
     "-sEXPORTED_RUNTIME_METHODS=ccall",
