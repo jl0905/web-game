@@ -63,13 +63,27 @@ int main(void)
 
     static const char *pos_cols[] = { "x", "y" };
     static const char *vel_cols[] = { "x", "y" };
+    CompSpec pos = { "position", 2, pos_cols };
+    CompSpec vel = { "velocity", 2, vel_cols };
+    CompSpec square = { "square", 0, NULL };
+
+    int64_t player = ecs_entity_create(db);
+    if (player < 1) {
+        sqlite3_close(db);
+        return 1;
+    }
+    ecs_component_set(db, &pos, player, (float[]){ 380.0f, 230.0f });
+    ecs_component_set(db, &vel, player, (float[]){ 0.0f, 0.0f });
+    ecs_component_set(db, &square, player, NULL);
+
     UpdateSystemConfig cfg = {
         .dim = 2,
-        .pos_cols = pos_cols,
-        .vel_cols = vel_cols,
         .params = { ACCEL, MAX_SPEED, FRICTION },
         .lo = { 0.0f, 0.0f },
         .hi = { PLATE_W - PLAYER_SIZE, PLATE_H - PLAYER_SIZE },
+        .pos = pos,
+        .vel = vel,
+        .tag_table = "square",
     };
 
     UpdateSystem update_system;
@@ -78,11 +92,7 @@ int main(void)
         return 1;
     }
 
-    static const char *render_pos_cols[] = { "x", "y" };
-    CompSpec render_specs[2] = {
-        { "position", 2, render_pos_cols },
-        { "square",   0, NULL },
-    };
+    CompSpec render_specs[2] = { pos, square };
     Query render_query;
     if (query_init(&render_query, db, render_specs, 2) != 0) {
         update_system_destroy(&update_system);

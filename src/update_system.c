@@ -8,19 +8,18 @@ typedef enum {
     COMP_SQUARE   = 2,
 } Component;
 
-static int prepare_update(sqlite3 *db, sqlite3_stmt **out,
-                          const char *table, const char *const *cols, int dim)
+static int prepare_update(sqlite3 *db, sqlite3_stmt **out, const CompSpec *spec)
 {
     char sql[192];
-    int off = snprintf(sql, sizeof sql, "UPDATE %s SET ", table);
-    for (int i = 0; i < dim; i++)
+    int off = snprintf(sql, sizeof sql, "UPDATE %s SET ", spec->table);
+    for (int i = 0; i < spec->ncols; i++)
         off += snprintf(sql + off, sizeof sql - (size_t)off,
-                        "%s%s=?%d", i > 0 ? "," : "", cols[i], i + 1);
+                        "%s%s=?%d", i > 0 ? "," : "", spec->cols[i], i + 1);
     off += snprintf(sql + off, sizeof sql - (size_t)off,
-                    " WHERE entity_id=?%d", dim + 1);
+                    " WHERE entity_id=?%d", spec->ncols + 1);
 
     if (sqlite3_prepare_v2(db, sql, -1, out, NULL) != SQLITE_OK) {
-        fprintf(stderr, "prepare_update(%s): %s\n", table, sqlite3_errmsg(db));
+        fprintf(stderr, "prepare_update(%s): %s\n", spec->table, sqlite3_errmsg(db));
         return -1;
     }
     return 0;
@@ -28,13 +27,21 @@ static int prepare_update(sqlite3 *db, sqlite3_stmt **out,
 
 int update_system_init(UpdateSystem *s, sqlite3 *db, const UpdateSystemConfig *cfg)
 {
+    if (cfg->dim < 1 || cfg->dim > PHYS_MAX_DIM) {
+        fprintf(stderr, "update_system_init: dim %d out of range [1, %d]\n", cfg->dim, PHYS_MAX_DIM);
+        return -1;
+    }
+    if (cfg->dim != cfg->pos.ncols || cfg->dim != cfg->vel.ncols) {
+        fprintf(stderr, "update_system_init: dim %d does not match component column counts\n", cfg->dim);
+        return -1;
+    }
+
     CompSpec specs[3] = {
-        { "position", cfg->dim, cfg->pos_cols },
-        { "velocity", cfg->dim, cfg->vel_cols },
-        { "square",   0, NULL },
+        cfg->pos,
+        cfg->vel,
+        { cfg->tag_table, 0, NULL },
     };
 
-    s->db = db;
     s->dim = cfg->dim;
     s->params = cfg->params;
     for (int i = 0; i < cfg->dim; i++) {
@@ -43,8 +50,8 @@ int update_system_init(UpdateSystem *s, sqlite3 *db, const UpdateSystemConfig *c
     }
 
     if (query_init(&s->query, db, specs, 3) != 0) return -1;
-    if (prepare_update(db, &s->upd_pos, "position", cfg->pos_cols, cfg->dim) != 0) return -1;
-    if (prepare_update(db, &s->upd_vel, "velocity", cfg->vel_cols, cfg->dim) != 0) return -1;
+    if (prepare_update(db, &s->upd_pos, &cfg->pos) != 0) return -1;
+    if (prepare_update(db, &s->upd_vel, &cfg->vel) != 0) return -1;
     return 0;
 }
 

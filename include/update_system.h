@@ -7,15 +7,15 @@
 
 typedef struct {
     int dim;
-    const char *const *pos_cols;
-    const char *const *vel_cols;
     PhysicsParams params;
     float lo[PHYS_MAX_DIM];
     float hi[PHYS_MAX_DIM];
+    CompSpec pos;
+    CompSpec vel;
+    const char *tag_table;
 } UpdateSystemConfig;
 
 typedef struct {
-    sqlite3 *db;
     Query query;
     sqlite3_stmt *upd_pos;
     sqlite3_stmt *upd_vel;
