@@ -24,9 +24,10 @@ int main(void)
     }
 
     // The game simulates and draws in a fixed logical resolution (PLATE_W x
-    // PLATE_H) and is scaled to whatever window/monitor size the player picks,
-    // letterboxed to preserve aspect. The window must exist before the plugins
-    // load their textures and fonts.
+    // PLATE_H) and is scaled to fill the window width. The logical height may
+    // overflow the window; once a camera follows the player, offscreen parts of
+    // the plate simply won't be visible. The window must exist before the
+    // plugins load their textures and fonts.
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
     InitWindow(1280, 800, "Emberholm - Fishing Draft");
     SetWindowMinSize(400, 250);
@@ -118,7 +119,7 @@ int main(void)
 
         float sw = (float)GetScreenWidth();
         float sh = (float)GetScreenHeight();
-        float scale = fminf(sw / PLATE_W, sh / PLATE_H);
+        float scale = sw / PLATE_W;
         float outW = PLATE_W * scale;
         float outH = PLATE_H * scale;
 
