@@ -23,6 +23,10 @@ const SQLITE_DIR = path.join("vendors", "sqlite");
 const SQLITE_C = path.join(SQLITE_DIR, "sqlite3.c");
 const SRCS = [
   "src/main.c",
+  "src/ui.c",
+  "src/plugin_game.c",
+  "src/plugin_fishing.c",
+  "src/plugin_economy.c",
   "src/query.c",
   "src/ecs.c",
   "src/physics.c",
